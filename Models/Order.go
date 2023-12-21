@@ -30,49 +30,69 @@ func GetOrdersByStatus(order *[]Order, filterValue string) (err error) {
 	return nil
 }
 
-var ch chan string = make(chan string, 100)
-
 func CreateOrder(order *Order) (err error) {
 	// if err = Config.DB.Create(order).Error; err != nil {
 	// 	return err
 	// }
 	// return nil
-	if err := Config.DB.Create(order).Error; err != nil {
-		return err
-	}
+	Config.DB.Transaction(func(tx *gorm.DB) error {
+
+		var products []Stock
+		json.Unmarshal(order.Products, &products)
+		if err := tx.Create(order).Error; err != nil {
+			return err
+		}
+		for _, item := range products {
+			product := &Product{}
+			if err = tx.Find(&product, "id=?", item.Id).Error; err != nil {
+				return err
+			}
+			product.Quantity = product.Quantity - item.Quantity
+			if err = tx.Save(product).Error; err != nil {
+				return err
+			}
+
+		}
+		return nil
+	})
 	go func() {
-		Config.DB.Transaction(func(tx *gorm.DB) error {
 
-			var products []Stock
-			json.Unmarshal(order.Products, &products)
-
-			for _, item := range products {
-				product := &Product{}
-				if err = tx.Find(&product, "id=?", item.Id).Error; err != nil {
+		select {
+		case <-time.After(5 * 60 * time.Second):
+			Config.DB.Transaction(func(tx *gorm.DB) error {
+				fmt.Print("rolled back")
+				order_new := &Order{}
+				if err = tx.Find(&order_new, "id=?", order.Id).Error; err != nil {
+					fmt.Println(err)
 					return err
 				}
-				product.Quantity = product.Quantity - item.Quantity
-				if err = tx.Save(product).Error; err != nil {
+				var products []Stock
+				json.Unmarshal(order.Products, &products)
+				fmt.Println(order_new.Status)
+				if order_new.Status != "processed" {
+					fmt.Println("not processed")
+					order_new.PaymentId = ""
+					order_new.Status = "failed"
+					tx.Save(order_new)
+					for _, item := range products {
+						product := &Product{}
+						if err = tx.Find(&product, "id=?", item.Id).Error; err != nil {
+							fmt.Println(err)
+							return err
+						}
+						product.Quantity = product.Quantity + item.Quantity
+						if err = tx.Save(product).Error; err != nil {
+							fmt.Println(err)
+							return err
+						}
+
+					}
 					return nil
 				}
+				return errors.New("transaction rollback fail")
+			})
+		}
 
-			}
-			select {
-			case x := <-ch:
-				fmt.Println(x)
-				return nil
-			case <-time.After(5 * 60 * time.Second):
-				FailedOrder := &Order{}
-				if err = Config.DB.Find(&FailedOrder, "id=?", order.Id).Error; err != nil {
-					return err
-				}
-				FailedOrder.PaymentId = "0"
-				FailedOrder.Status = "failed"
-				Config.DB.Save(&FailedOrder)
-				return errors.New("transaction failed")
-			}
-
-		})
 	}()
 	return nil
 }
@@ -83,7 +103,7 @@ func UpdatePayment(orderId string, paymentId string) (err error) {
 	}
 	order.PaymentId = paymentId
 	order.Status = "processed"
-	ch <- orderId
+
 	Config.DB.Save(&order)
 	return nil
 }
